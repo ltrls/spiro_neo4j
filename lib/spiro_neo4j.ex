@@ -37,13 +37,9 @@ defmodule Spiro.Adapter.Neo4j do
   def set_labels(vertex, module), do: GenServer.call(module, {:set_labels, vertex})
   def remove_label(vertex, label, module), do: GenServer.call(module, {:remove_label, vertex, label})
 
-  def all_degree(vertex, types, module), do: GenServer.call(module, {:all_degree, vertex, types})
-  def in_degree(vertex, types, module), do: GenServer.call(module, {:in_degree, vertex, types})
-  def out_degree(vertex, types, module), do: GenServer.call(module, {:out_degree, vertex, types})
-
-  def all_edges(vertex, types, module), do: GenServer.call(module, {:all_edges, vertex, types})
-  def in_edges(vertex, types, module), do: GenServer.call(module, {:in_edges, vertex, types})
-  def out_edges(vertex, types, module), do: GenServer.call(module, {:out_edges, vertex, types})
+  def node_degree(vertex, direction, types, module), do: GenServer.call(module, {:node_degree, direction, vertex, types})
+  def adjacent_edges(vertex, direction, types, module), do: GenServer.call(module, {:adjacent_edges, direction, vertex, types})
+  def node_neighbours(vertex, direction, types, module), do: GenServer.call(module, {:node_neighbours, direction, vertex, types})
 
   defp vertex_url(id), do: "/db/data/node/#{id}"
   defp edge_url(id), do: "/db/data/relationship/#{id}"
@@ -72,12 +68,30 @@ defmodule Spiro.Adapter.Neo4j do
     Logger.debug "sending #{method |> to_string |> String.upcase} request " <>
       "to #{url} with params:\n" <> String.slice(Poison.encode!(params), 0, 80)
     case HTTPoison.request!(method, url, Poison.encode!(params), headers, [hackney: hackney]) do
-      %HTTPoison.Response{status_code: 204} -> :no_content
+      %HTTPoison.Response{status_code: 204}             -> :no_content
+      %HTTPoison.Response{status_code: 500}             -> {:error, :unknown_error}
       %HTTPoison.Response{status_code: 200, body: body} -> {:ok, Poison.decode!(body)}
       %HTTPoison.Response{status_code: 201, body: body} -> {:created, Poison.decode!(body)}
       %HTTPoison.Response{status_code: 400, body: body} -> {:error, Poison.decode!(body)["exception"]}
+      %HTTPoison.Response{status_code: 404, body: ""}   -> {:not_found, :unknown_error}
       %HTTPoison.Response{status_code: 404, body: body} -> {:not_found, Poison.decode!(body)["exception"]}
       %HTTPoison.Response{status_code: 409, body: body} -> {:conflict, Poison.decode!(body)["exception"]}
+    end
+  end
+  
+  defp catch_errors(response, success_fun, error_fun) do
+    case response do
+      {:not_found, "NodeNotFoundException"} -> error_fun.(:not_found)
+      {:not_found, "RelationshipNotFoundException"} -> error_fun.(:not_found)
+      {:not_found, "StartNodeNotFoundException"} -> error_fun.(:not_found)
+      {:not_found, :unknown_error} -> error_fun.(:not_found)
+      {:conflict, "ConstraintViolationException"} -> error_fun.(:constraint_violation)
+      {:error, "BadInputException"} -> error_fun.(:bad_input)
+      {:error, "PropertyValueException"} -> error_fun.(:bad_input)
+      {:error, :unknown_error} -> error_fun.(:unknown_error)
+      {:ok, body} -> success_fun.(body)
+      {:created, body} -> success_fun.(body)
+      :no_content -> success_fun.(:no_content)
     end
   end
 
@@ -85,10 +99,10 @@ defmodule Spiro.Adapter.Neo4j do
   # TODO: extract error catching in a single function
   def handle_call({:add_vertex, %Vertex{properties: properties} = vertex}, _from, opts) do
     params = properties |> Enum.into(%{})
-    case request(:post, "/db/data/node", params, opts) do
-      {:created, v} -> {:reply, %{vertex | id: v["metadata"]["id"]}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:post, "/db/data/node", params, opts)
+            |> catch_errors(&(%{vertex | id: &1["metadata"]["id"]}),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:add_edge, %Edge{properties: properties, to: to, from: from, type: type} = edge}, _from, opts) do
@@ -96,94 +110,87 @@ defmodule Spiro.Adapter.Neo4j do
     params = %{to: vertex_url(to.id),
       type: type,
       data: Enum.into(properties, %{}) }
-    case request(:post, url, params, opts) do
-      {:created, e} -> {:reply, %{edge | id: e["metadata"]["id"]}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:post, url, params, opts)
+            |> catch_errors(&(%{edge | id: &1["metadata"]["id"]}),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
   def handle_call({:update_vertex, %Vertex{id: id, properties: properties} = vertex}, _from, opts) do
     params = properties |> Enum.into(%{})
-    case request(:put, vertex_url(id) <> "/properties", params, opts) do
-      :no_content -> {:reply, vertex, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:put, vertex_url(id) <> "/properties", params, opts)
+            |> catch_errors(fn (_no_content) -> vertex end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:update_edge, %Edge{id: id, properties: properties} = edge}, _from, opts) do
     params = properties |> Enum.into(%{})
-    case request(:put, edge_url(id) <> "/properties", params, opts) do
-      :no_content ->{:reply, edge, opts}
-      {:not_found, "RelationshipNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:put, edge_url(id) <> "/properties", params, opts)
+            |> catch_errors(fn (_no_content) -> edge end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
   def handle_call({:delete_vertex, %Vertex{id: id}}, _from, opts) do
-    case request(:delete, vertex_url(id), %{}, opts) do
-      :no_content -> {:noreply, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:conflict, "ConstraintViolationException"} -> {:reply, {:error, :constraint_violation}, opts}
-    end
+    resp = request(:delete, vertex_url(id), %{}, opts)
+            |> catch_errors(fn (_no_content) -> :ok end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:delete_edge, %Edge{id: id}}, _from, opts) do
-    case request(:delete, edge_url(id), %{}, opts) do
-      :no_content -> {:noreply, opts}
-      {:not_found, "RelationshipNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:delete, edge_url(id), %{}, opts)
+            |> catch_errors(fn (_no_content) -> :ok end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
   def handle_call({:vertex_properties, %Vertex{id: id}}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/properties", %{}, opts) do
-      {:ok, properties} -> {:reply, properties, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:get, vertex_url(id) <> "/properties", %{}, opts)
+            |> catch_errors(&(&1),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:edge_properties, %Edge{id: id}}, _from, opts) do
-    case request(:get, edge_url(id) <> "/properties", %{}, opts) do
-      {:ok, properties} -> {:reply, properties, opts}
-      {:not_found, "RelationshipNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:get, edge_url(id) <> "/properties", %{}, opts)
+            |> catch_errors(&(&1),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
   def handle_call({:get_vertex_property, %Vertex{id: id}, key}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/properties/#{key}", %{}, opts) do
-      {:ok, value} -> {:reply, value, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:get, vertex_url(id) <> "/properties/#{key}", %{}, opts)
+            |> catch_errors(&(&1),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:set_vertex_property, %Vertex{id: id} = vertex, key, value}, _from, opts) do
-    case request(:put, vertex_url(id) <> "/properties/#{key}", value, opts) do
-      :no_content -> {:reply, vertex, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:put, vertex_url(id) <> "/properties/#{key}", value, opts)
+            |> catch_errors(fn (_no_content) -> vertex end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
   def handle_call({:get_edge_property, %Edge{id: id}, key}, _from, opts) do
-    case request(:get, edge_url(id) <> "/properties/#{key}", %{}, opts) do
-      {:ok, value} -> {:reply, value, opts}
-      {:not_found, "RelationshipNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:get, edge_url(id) <> "/properties/#{key}", %{}, opts)
+            |> catch_errors(&(&1),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:set_edge_property, %Edge{id: id} = edge, key, value}, _from, opts) do
-    case request(:put, edge_url(id) <> "/properties/#{key}", value, opts) do
-      :no_content -> {:reply, edge, opts}
-      {:not_found, "RelationshipNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-      {:error, "PropertyValueException"} -> {:reply, {:error, :bad_input}, opts}
-    end
+    resp = request(:put, edge_url(id) <> "/properties/#{key}", value, opts)
+            |> catch_errors(fn (_no_content) -> edge end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
@@ -199,93 +206,89 @@ defmodule Spiro.Adapter.Neo4j do
 
 
   def handle_call({:vertices_by_label, label}, _from, opts) do
-    {:ok, vertices} = request(:get, "/label/#{label}/nodes", %{}, opts)
-    vertices = Enum.map(vertices, &(create_vertex(&1)))
-    {:reply, vertices, opts}
+    resp = request(:get, "/label/#{label}/nodes", %{}, opts)
+            |> catch_errors(fn (vertices) -> Enum.map(vertices, &(create_vertex(&1))) end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:get_labels, %Vertex{id: id}}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/labels", %{}, opts) do
-      {:ok, labels} -> {:reply, labels, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:get, vertex_url(id) <> "/labels", %{}, opts)
+            |> catch_errors(&(&1),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:add_labels, %Vertex{id: id} = vertex, labels}, _from, opts) do
-    case request(:post, vertex_url(id) <> "/labels", labels, opts) do
-      :no_content -> {:reply, vertex, opts}
-      {:error, "BadInputException"} -> {:reply, {:error, :bad_input}, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:post, vertex_url(id) <> "/labels", labels, opts)
+            |> catch_errors(fn (_no_content) -> vertex end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:set_labels, %Vertex{id: id, labels: labels} = vertex}, _from, opts) do
-    case request(:put, vertex_url(id) <> "/labels", labels, opts) do
-      :no_content -> {:reply, vertex, opts}
-      {:error, "BadInputException"} -> {:reply, {:error, :bad_input}, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:put, vertex_url(id) <> "/labels", labels, opts)
+            |> catch_errors(fn (_no_content) -> vertex end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
   def handle_call({:remove_label, %Vertex{id: id} = vertex, label}, _from, opts) do
-    case request(:delete, vertex_url(id) <> "/labels" <> label, %{}, opts) do
-      :no_content -> 
-      vertex = update_in(vertex.labels, fn (labels) ->
-        List.delete(labels, label)
-      end)
-      {:reply, vertex, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:delete, vertex_url(id) <> "/labels" <> label, %{}, opts)
+            |> catch_errors(fn (_no_content) -> update_in(vertex.labels, &List.delete(&1, label)) end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
-  def handle_call({:all_degree, %Vertex{id: id}, types}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/degree/all/" <> Enum.join(types, "&"), %{}, opts) do
-      {:ok, degree} -> {:reply, degree, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
+  def handle_call({:all_degree, %Vertex{id: id}, direction, types}, _from, opts) do
+    url = case direction do
+      :in -> vertex_url(id) <> "/degree/in/" <> Enum.join(types, "&")
+      :out -> vertex_url(id) <> "/degree/out/" <> Enum.join(types, "&")
+      :all -> vertex_url(id) <> "/degree/all/" <> Enum.join(types, "&")
     end
-  end
-
-  def handle_call({:in_degree, %Vertex{id: id}, types}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/degree/in/" <> Enum.join(types, "&"), %{}, opts) do
-      {:ok, degree} -> {:reply, degree, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
-  end
-
-  def handle_call({:out_degree, %Vertex{id: id}, types}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/degree/out/" <> Enum.join(types, "&"), %{}, opts) do
-      {:ok, degree} -> {:reply, degree, opts}
-      {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
+    resp = request(:get, url, %{}, opts)
+            |> catch_errors(&(&1),
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
 
-  def handle_call({:all_edges, %Vertex{id: id}, types}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/relationships/all/" <> Enum.join(types, "&"), %{}, opts) do
-      {:ok, edges} ->
-        edges = Enum.map(edges, &(create_edge(&1)))
-        {:reply, edges, opts}
-        {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
+  def handle_call({:adjacent_edges, %Vertex{id: id}, direction, types}, _from, opts) do
+    url = case direction do
+      :in -> vertex_url(id) <> "/relationships/in/" <> Enum.join(types, "&")
+      :out -> vertex_url(id) <> "/relationships/out/" <> Enum.join(types, "&")
+      :all -> vertex_url(id) <> "/relationships/all/" <> Enum.join(types, "&")
     end
+    resp = request(:get, url, %{}, opts)
+            |> catch_errors(fn (edges) -> Enum.map(edges, &(create_edge(&1))) end,
+                            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
-  def handle_call({:in_edges, %Vertex{id: id}, types}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/relationships/in/" <> Enum.join(types, "&"), %{}, opts) do
-      {:ok, edges} ->
-        edges = Enum.map(edges, &(create_edge(&1)))
-        {:reply, edges, opts}
-        {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
+
+  def handle_call({:node_neighbours, %Vertex{id: id}, direction, types}, _from, opts) do
+    url = case direction do
+      :in -> vertex_url(id) <> "/relationships/in/" <> Enum.join(types, "&")
+      :out -> vertex_url(id) <> "/relationships/out/" <> Enum.join(types, "&")
+      :all -> vertex_url(id) <> "/relationships/all/" <> Enum.join(types, "&")
     end
+    resp = request(:get, url, %{}, opts)
+            |> catch_errors(fn (edges) ->
+              Enum.map(edges, fn (edge) ->
+                edge = create_edge(edge)
+                case edge.from.id do
+                  ^id -> %Vertex{id: edge.to.id}
+                  _ -> %Vertex{id: edge.from.id}
+                end
+              end)
+            end,
+            &({:error, &1}))
+    {:reply, resp, opts}
   end
 
-  def handle_call({:out_edges, %Vertex{id: id}, types}, _from, opts) do
-    case request(:get, vertex_url(id) <> "/relationships/out/" <> Enum.join(types, "&"), %{}, opts) do
-      {:ok, edges} ->
-        edges = Enum.map(edges, &(create_edge(&1)))
-        {:reply, edges, opts}
-        {:not_found, "NodeNotFoundException"} -> {:reply, {:error, :not_found}, opts}
-    end
-  end
+  def supported_functions, do: %{vertex_labels: true,
+                                 edge_type: true,
+                                 query: true}
 
 end
