@@ -37,9 +37,9 @@ defmodule Spiro.Adapter.Neo4j do
   def set_labels(vertex, module), do: GenServer.call(module, {:set_labels, vertex})
   def remove_label(vertex, label, module), do: GenServer.call(module, {:remove_label, vertex, label})
 
-  def node_degree(vertex, direction, types, module), do: GenServer.call(module, {:node_degree, vertex, direction, types})
+  def vertex_degree(vertex, direction, types, module), do: GenServer.call(module, {:vertex_degree, vertex, direction, types})
   def adjacent_edges(vertex, direction, types, module), do: GenServer.call(module, {:adjacent_edges, vertex, direction, types})
-  def node_neighbours(vertex, direction, types, module), do: GenServer.call(module, {:node_neighbours, vertex, direction, types})
+  def vertex_neighbours(vertex, direction, types, module), do: GenServer.call(module, {:vertex_neighbours, vertex, direction, types})
 
 
 
@@ -251,7 +251,7 @@ defmodule Spiro.Adapter.Neo4j do
   end
 
 
-  def handle_call({:node_degree, %Vertex{id: id}, direction, types}, _from, opts) do
+  def handle_call({:vertex_degree, %Vertex{id: id}, direction, types}, _from, opts) do
     url = case direction do
       :in -> vertex_url(id) <> "/degree/in/" <> Enum.join(types, "&")
       :out -> vertex_url(id) <> "/degree/out/" <> Enum.join(types, "&")
@@ -277,7 +277,7 @@ defmodule Spiro.Adapter.Neo4j do
   end
 
 
-  def handle_call({:node_neighbours, %Vertex{id: id}, direction, types}, _from, opts) do
+  def handle_call({:vertex_neighbours, %Vertex{id: id}, direction, types}, _from, opts) do
     url = case direction do
       :in -> vertex_url(id) <> "/relationships/in/" <> Enum.join(types, "&")
       :out -> vertex_url(id) <> "/relationships/out/" <> Enum.join(types, "&")
