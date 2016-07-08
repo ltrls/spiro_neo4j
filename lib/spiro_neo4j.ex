@@ -13,8 +13,8 @@ defmodule Spiro.Adapter.Neo4j do
   def add_vertex(vertex, module), do: GenServer.call(module, {:add_vertex, vertex})
   def add_edge(edge, module), do: GenServer.call(module, {:add_edge, edge})
 
-  def update_vertex(vertex, module), do: GenServer.call(module, {:update_vertex, vertex})
-  def update_edge(edge, module), do: GenServer.call(module, {:update_edge, edge})
+  def set_vertex_properties(vertex, module), do: GenServer.call(module, {:set_vertex_properties, vertex})
+  def set_edge_properties(edge, module), do: GenServer.call(module, {:set_edge_properties, edge})
 
   def delete_vertex(vertex, module), do: GenServer.call(module, {:delete_vertex, vertex})
   def delete_edge(edge, module), do: GenServer.call(module, {:delete_edge, edge})
@@ -50,14 +50,10 @@ defmodule Spiro.Adapter.Neo4j do
 
   defp get_id(url), do: Regex.run(~r/\d+$/, url) |> List.first |> String.to_integer
 
-  defp mk_klist(map) do
-    Enum.reduce(map, [], fn ({key, val}, acc) -> [{String.to_atom(key), val} | acc] end)
-  end
-
   defp create_edge(edge) do
     %Edge{id: edge["metadata"]["id"],
       type: edge["type"],
-      properties: mk_klist(edge["data"]),
+      properties: Enum.into(edge["data"], []),
       from: %Vertex{id: get_id(edge["start"])},
       to: %Vertex{id: get_id(edge["en" <> "d"])} }
   end
@@ -65,7 +61,7 @@ defmodule Spiro.Adapter.Neo4j do
   defp create_vertex(vertex) do
     %Vertex{id: vertex["metadata"]["id"],
       labels: vertex["metadata"]["labels"],
-      properties: mk_klist(vertex["data"]) }
+      properties: Enum.into(vertex["data"], []) }
   end
 
   defp request(method, url, params, opts) do
@@ -128,7 +124,7 @@ defmodule Spiro.Adapter.Neo4j do
   end
 
 
-  def handle_call({:update_vertex, %Vertex{id: id, properties: properties} = vertex}, _from, opts) do
+  def handle_call({:set_vertex_properties, %Vertex{id: id, properties: properties} = vertex}, _from, opts) do
     params = properties |> Enum.into(%{})
     resp = request(:put, vertex_url(id) <> "/properties", params, opts)
             |> catch_errors(fn (_no_content) -> vertex end,
@@ -136,14 +132,13 @@ defmodule Spiro.Adapter.Neo4j do
     {:reply, resp, opts}
   end
 
-  def handle_call({:update_edge, %Edge{id: id, properties: properties} = edge}, _from, opts) do
+  def handle_call({:set_edge_properties, %Edge{id: id, properties: properties} = edge}, _from, opts) do
     params = properties |> Enum.into(%{})
     resp = request(:put, edge_url(id) <> "/properties", params, opts)
             |> catch_errors(fn (_no_content) -> edge end,
                             &({:error, &1}))
     {:reply, resp, opts}
   end
-
 
   def handle_call({:delete_vertex, %Vertex{id: id}}, _from, opts) do
     resp = request(:delete, vertex_url(id), %{}, opts)
@@ -161,14 +156,14 @@ defmodule Spiro.Adapter.Neo4j do
 
   def handle_call({:vertex_properties, %Vertex{id: id}}, _from, opts) do
     resp = request(:get, vertex_url(id) <> "/properties", %{}, opts)
-            |> catch_errors(&(mk_klist(&1)),
+            |> catch_errors(&(Enum.into(&1, [])),
                             &({:error, &1}))
     {:reply, resp, opts}
   end
 
   def handle_call({:edge_properties, %Edge{id: id}}, _from, opts) do
     resp = request(:get, edge_url(id) <> "/properties", %{}, opts)
-            |> catch_errors(&(mk_klist(&1)),
+            |> catch_errors(&(Enum.into(&1, [])),
                             &({:error, &1}))
     {:reply, resp, opts}
   end
